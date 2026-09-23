@@ -2897,21 +2897,10 @@
   // beats their existing best for this track. The recording is the full run
   // (legit = the reconstructed live inputs; savestate = prefix + live merged).
   async function autoUploadDrivenFinish(finishFrames) {
-    try {
-      if (!board.cfg().autoUpload) return;
-      var trackId = TAS.currentTrackId || (gate.lastRun && gate.lastRun.track_id);
-      if (!trackId) return; // can't attribute the run to a track
-      var ss = capture._ssRun, rec;
-      if (ss) rec = await ssMergeRecording(ss.prefix, capture.liveRecording, ss.frame | 0);
-      else rec = capture.liveRecording;
-      if (!rec || rec.numberOfInputs() < 1) return;
-      var enc = await rec.serialize();
-      var run = { track_id: trackId, category: "driven", frames: finishFrames | 0, recording: enc, car_style: capture.carStyle || "", nickname: uploadNickname(), user_id: TAS.userId || null };
-      var res = await board.uploadIfBest(run);
-      if (res.uploaded) toast("Posted to the TAS leaderboard — driven · " + fmtTime(run.frames) + (res.pb ? " (new PB!)" : ""));
-      else if (res.error) toast("TAS leaderboard upload failed: " + res.error);
-    } catch (e) { TAS.log("driven auto-upload failed: " + e); }
-  }
+  // Event build: savestate runs use the game's left leaderboard.
+  // The game's normal leaderboard request is allowed by gate.allowOfficial().
+  return;
+}
 
   function installViewerContext() {
     var wasIn = false, stableMiss = 0, menuWas = false;
