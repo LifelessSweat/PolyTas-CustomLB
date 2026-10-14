@@ -14,7 +14,7 @@
  *   - the sim worker filename "simulation_worker.bundle.js"
  *   - the numeric messageType protocol + field shapes
  *   - the 227-byte CarState binary layout
- *   - the leaderboard host ptproxy.cwcinc.dev + "/leaderboard"
+ *   - the leaderboard host polyproxy.polymodloader.com + "/v6/leaderboard"
  *
  * Phase 2 (bruteforce) adds tas/tas-sim.worker.js + tas/vendor/determinism.js.
  * Phase 3 (savestate) adds replay-drive support.
@@ -832,7 +832,7 @@
       if (String(method || "").toUpperCase() !== "POST") return false;
       var u = String(url || ""), host = "", path = u;
       try { var p = new URL(u, location.href); host = p.host; path = p.pathname; } catch (e) { host = u; path = u.split("?")[0]; }
-      if (host.indexOf("ptproxy.cwcinc.dev") < 0) return false;       // only the kodub API
+      if (host !== "polyproxy.polymodloader.com") return false; // only the game API
       if (/\/leaderboard$/.test(path)) return true;            // the known submit endpoint
       try { if (typeof body === "string" && /(^|&)recording=/.test(body)) return true; } catch (e) {} // submit body signature
       return false;
@@ -869,7 +869,7 @@
    * Every TAS and savestate submission goes through the same endpoint as the
    * game's main leaderboard.
    * ================================================================== */
-  var MAIN_LB_URL = "https://ptproxy.cwcinc.dev/leaderboard";
+  var MAIN_LB_URL = "https://polyproxy.polymodloader.com/v6/leaderboard";
   function submitOfficialRun(run) {
     return new Promise(function (resolve) {
       var userToken = gameUserToken();
@@ -896,18 +896,25 @@
           resolve({ ok: false, error: "HTTP " + req.status + " " + (req.responseText || "") });
           return;
         }
-        try {
-          var parsed = JSON.parse(req.responseText || "null");
-          if (parsed !== null && typeof parsed === "object" && ("uploadId" in parsed || "previousPosition" in parsed || "newPosition" in parsed)) {
-            resolve({ ok: true, payload: parsed });
+        var parsed;
+        try { parsed = JSON.parse(req.responseText || "null"); }
+        catch (e) { resolve({ ok: false, error: "Invalid leaderboard response: " + e.message }); return; }
+        if (typeof parsed === "number" || parsed === null) {
+          if (parsed !== null && !Number.isSafeInteger(parsed)) {
+            resolve({ ok: false, error: "Invalid leaderboard upload ID" });
             return;
           }
-          if (typeof parsed === "number" || parsed === null) {
-            resolve({ ok: true, payload: { uploadId: parsed } });
-            return;
-          }
-        } catch (e) {}
-        resolve({ ok: true, raw: req.responseText || "" });
+          resolve({ ok: true, payload: { uploadId: parsed } });
+          return;
+        }
+        if (!parsed || typeof parsed !== "object" ||
+            !("uploadId" in parsed) || (parsed.uploadId !== null && !Number.isSafeInteger(parsed.uploadId)) ||
+            !Number.isSafeInteger(parsed.previousPosition) || parsed.previousPosition < 0 ||
+            !Number.isSafeInteger(parsed.newPosition) || parsed.newPosition < 0) {
+          resolve({ ok: false, error: "Invalid leaderboard response" });
+          return;
+        }
+        resolve({ ok: true, payload: parsed });
       };
       req.onerror = function () { resolve({ ok: false, error: "network error" }); };
       req.ontimeout = function () { resolve({ ok: false, error: "timeout" }); };
@@ -922,7 +929,7 @@
   gate.noteUrl = function (url) {
     try {
       var u = new URL(String(url || ""), location.href);
-      if (u.host.indexOf("ptproxy.cwcinc.dev") >= 0 && /leaderboard/.test(u.pathname)) {
+      if (u.host === "polyproxy.polymodloader.com" && /\/v6\/leaderboard$/.test(u.pathname)) {
         var t = u.searchParams.get("trackId");
         if (t && t !== TAS.currentTrackId) { TAS.currentTrackId = t; bus.emit("track", t); }
         var uh = u.searchParams.get("userTokenHash");

@@ -72,7 +72,7 @@ always one of these:
 - **CarState binary layout** — 227-byte variable-length buffer; § 4.
 - **Recording codec** — 5 toggle channels → zlib → base64url; byte-compatible with
   the game's; § 5.
-- **Leaderboard endpoint** — host contains `ptproxy.cwcinc.dev`, path ends `/leaderboard`
+- **Leaderboard endpoint** — `https://polyproxy.polymodloader.com/v6/leaderboard`
   (`TAS.gate.isSubmit`). Requests pass through unchanged to the main game leaderboard.
 
 ---
