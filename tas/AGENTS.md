@@ -1,8 +1,7 @@
 # TAS Tool — AI context / internals (newer version)
 
 Orients an AI assistant working on this PolyTrack TAS tool. Companion docs:
-[README.md](README.md) = how to *use* it; [TASBOARD.md](TASBOARD.md) = the
-community-leaderboard (Supabase) setup. **This** file = how it's *built*, so you
+[README.md](README.md) = how to use it. **This** file = how it's built, so you
 can edit it safely.
 
 > **Primary edit target:** [tas.js](tas.js) — one self-contained ~2600-line IIFE.
@@ -10,11 +9,11 @@ can edit it safely.
 > `index.html` / the Electron layer, all outside `tas/`.
 
 > **Scope note:** §§ 1–10 + 12 (the portable core, wire contracts, CarState,
-> recording, gate, shield, savestate, game-bundle edits) are documented in full and
-> are shared with the base tool. The **newer-only features** — the native TAS
-> **board / leaderboard twin**, the **positions HUD**, **simulate-finish**, and the
-> **island/snapshot bruteforce** — are summarized (§ 11, § 13) with pointers to the
-> code + TASBOARD.md rather than exhaustively reverse-documented. Read the code for
+> recording, leaderboard integration, shield, savestate, game-bundle edits) are
+> documented in full and are shared with the base tool. The **newer-only
+> features** — the **positions HUD**, **simulate-finish**, and the
+> **island/snapshot bruteforce** — are summarized (§ 11, § 13) rather than
+> exhaustively reverse-documented. Read the code for
 > their exact internals before touching them.
 
 ---
@@ -33,18 +32,18 @@ IPC in hot loops. Design goals, in priority order:
 ### Feature status
 | Area | State | Notes |
 |------|:-----:|-------|
-| Capture backbone · telemetry overlay · input editor (`tap`) · leaderboard gate · input shield | ✅ | Portable core (§§ 3–10) |
-| Bruteforce — parallel worker pool, **trigger-box objective** (boxes only; put one on the finish line), **island/population** evolutionary search, **snapshot** (prefix-skip) mode | ✅ | § 11 |
+| Capture backbone · telemetry overlay · input editor (`tap`) · main leaderboard integration · input shield | ✅ | Portable core (§§ 3–10) |
+| Bruteforce — parallel worker pool, **ordered trigger-box objective**, **island/population** evolutionary search, **snapshot** (prefix-skip) mode | ✅ | § 11 |
 | **Savestate** — drive a run from any frame N; `ssSet`/`ssReturn` set/return-to a live position | ✅ | § 8 |
 | TAS settings inside the game's own Settings page | ✅ | § 14 |
-| **Native TAS board** (Supabase) + **leaderboard twin** docked by the real board; **positions HUD**; **simulate-finish → upload** | ✅ | Newer-only; § 13 + [TASBOARD.md](TASBOARD.md) |
+| Main leaderboard uploads for live savestate runs and simulated edits; **positions HUD**; **simulate-finish → upload** | ✅ | Newer-only; § 13 |
 | **UI scale**, **speed decimals** (overlay + game speedometer), **trigger-box cards**, **BF live-stats** | ✅ | Ported in (§ 18 changelog) |
 
 ---
 
 ## 2. File & integration map
 
-Inside `tas/`: **`tas.js`** (the whole tool), **`README.md`**, **`TASBOARD.md`**,
+Inside `tas/`: **`tas.js`** (the whole tool), **`README.md`**, and
 **`AGENTS.md`** (this file).
 
 Outside `tas/` (keep in sync when porting):
@@ -74,8 +73,7 @@ always one of these:
 - **Recording codec** — 5 toggle channels → zlib → base64url; byte-compatible with
   the game's; § 5.
 - **Leaderboard endpoint** — host contains `ptproxy.cwcinc.dev`, path ends `/leaderboard`
-  (`TAS.gate.isSubmitUrl`). This is the **official** board the gate blocks; the
-  tool's own board (§ 13) is a separate Supabase host.
+  (`TAS.gate.isSubmit`). Requests pass through unchanged to the main game leaderboard.
 
 ---
 
@@ -147,21 +145,20 @@ savestate prefix injection also lives in `onOutbound`.
 Drive live from an arbitrary frame **N** of the viewed replay. The worker can't seed
 a moving car's velocity, so the prefix `[0..N)` is **re-simulated** (fast-forwarded
 in the patched worker), then the same car switches to live keyboard at N.
-`armSavestate(frame,text)` encodes the editor script as prefix + `setTaint(frame>0)`;
+`armSavestate(frame,text)` encodes the editor script as a prefix;
 `window.__TAS_view.drive(...)` leaves the viewer; `onOutbound` injects prefix +
 `tasSwitchFrame` into the player CreateCar (re-applies on each reset). Newer keybinds:
 **`ssSet`** marks a live position, **`ssReturn`** returns to it (`ssSetPoint` /
-`ssGotoLast`; positions HUD § 13). Taint (`window.__TAS_tainted`) blocks the official
-upload (§ 9); the native board (§ 13) still records driven runs.
+`ssGotoLast`; positions HUD § 13). Finishes submit to the main leaderboard.
 
 ---
 
-## 9. Leaderboard gate (`TAS.gate`)
+## 9. Main leaderboard integration (`TAS.gate`)
 
-No-op unless `window.__TAS_tainted`. **XHR shim** drops a tainted `POST` matching
-`isSubmitUrl` and synthesizes a clean `200`/`"null"` (readystatechange+load+loadend);
-**fetch guard** mirrors it. Match = `POST` + host `ptproxy.cwcinc.dev` + path ending
-`/leaderboard`. Local PB/ghost persist before the network call, so they're unaffected.
+The XHR and fetch hooks observe leaderboard requests to capture track and run
+metadata, then pass every request through unchanged. Live and savestate finishes
+submit to the main leaderboard endpoint; **Apply → replay** also simulates and
+submits edited inputs there. There is no separate TAS leaderboard.
 
 ---
 
@@ -178,19 +175,22 @@ the car) but **not** `preventDefault()` (field still types).
 Spawns a pool of **untapped** real physics workers (via `capture._RealWorker`), inits
 from the captured `Init` with `isRealtime:false`, and evolves input variants.
 
-- **Objective = trigger boxes, full stop.** There is no `checkpoint`/`finish` objective
-  any more (no `BF.objective`, `bf-obj`, `BF.target*`, `acc.targetFrame`): you place a
-  box on each checkpoint you care about and one on the **finish line**, and the search
-  optimizes the frame it reaches the last box. That old objective had no target position
-  to aim at — it never learned where checkpoints are in world space — so its fallback
-  score was `maxCp*1e5 + lastSpeed`, i.e. *maximize speed and hope you get lucky*. Boxes
-  carry their own distance gradient, which is why this replaced the planned unified
-  waypoint list. Ordered boxes + `dist↔speed` blend + **no-go** boxes → `-Infinity`.
+- **Objective = ordered trigger boxes, full stop.** There is no automatic
+  `checkpoint`/`finish` target any more (no `BF.objective`, `bf-obj`, `BF.target*`,
+  `acc.targetFrame`). The user places one or more boxes at world positions; the search
+  optimizes reaching them in order. A final box can target the finish line, but that is
+  not automatic. The old objective had no target position to aim at — it never learned
+  where checkpoints are in world space — so its fallback score was
+  `maxCp*1e5 + lastSpeed`, i.e. *maximize speed and hope you get lucky*. Boxes carry
+  their own distance gradient, which is why this replaced the planned unified waypoint
+  list. Ordered boxes + `dist↔speed` blend + **no-go** boxes → `-Infinity`.
   Mutations (`bfMutate`) confined to `[startFrame,endFrame)`; a fixed end-anchor keeps
   post-window play identical. `bfNewAcc`/`bfAccumulate`/`bfScore`/`bfDescribeAcc`.
   `acc.maxCp`/`finished`/`finishFrames` survive as **readout only** (`cp3 FIN@29995`) —
   the game's own checkpoint count and finish frame are the cross-check on your box
   placement (`box 1/3 cp4` = the car is fine, a box is in the wrong spot).
+  Keep the user guide in sync: there is no automatic checkpoint/finish target in the UI;
+  explain how to place ordered boxes with **+ at car** or world coordinates.
 - **Crossing the finish does NOT end the run** (`bfIsDone`; worker's `done` condition).
   It used to, and that inverted the search whenever the last box sat on the finish line:
   the game latches `finished` the frame the car enters the finish detector, the run was
@@ -374,25 +374,21 @@ the two use **opposite sign conventions** and must stay in agreement. Backups:
    `tas.js` mirrors `settings.speedDecimals` → `window.__TAS_speedDecimals`
    (`applySpeedDecimals`, at eval + every `settings` event); the game reads it/frame.
 
-> The newer **board / leaderboard-twin / positions-HUD** features may rely on
+> The newer **positions-HUD** features may rely on
 > additional game data (e.g. nickname, `userTokenHash`, `car_style`, `__TAS_carThumb`).
 > If a port breaks them, **diff `main.bundle.js` against `.orig`** to enumerate every
-> hook — this doc does not exhaustively list the board's exposures.
+> hook.
 
 ---
 
 ## 13. Newer-only features (summary — read the code before editing)
 
-- **Native TAS board** (`BOARD_URL` Supabase; see [TASBOARD.md](TASBOARD.md)) — the
-  tool's own community board, **never** the official one. Runs tagged `driven`
-  (finished, incl. savestate) or `edited` (input-edited full TAS), full recording
-  attached. `board.cfg()`/`board.patchCfg()` (autoUpload etc., in `localStorage`).
-- **Leaderboard twin** (`installLeaderboardTwin`) — docks the board next to the real
-  in-game leaderboard; filter Driven/Edited; click a row to load into the editor.
+- **Main leaderboard uploads** — live finishes (including savestate runs) and
+  simulated edited recordings submit to the game's main leaderboard.
 - **Positions HUD** (`buildPositionsHUD`) — in-run savestate-position aid for the
   `ssSet`/`ssReturn` workflow.
-- **Simulate-finish** (`boardSimulateFinish`) — headlessly sims the editor inputs to
-  the finish, reads the real time (`Simulate finish → upload TAS` / `⏱ Time`).
+- **Simulate-finish** (`simulateFinish`) — headlessly sims the editor inputs to
+  the finish, reads the real time (`Simulate finish → upload` / `⏱ Time`).
 
 These are viewer/driving features layered on the same capture + recording core; they
 reuse `fmtSpeed`/`fmtTime` for display where they show speed/time.
@@ -403,22 +399,20 @@ reuse `fmtSpeed`/`fmtTime` for display where they show speed/time.
 
 All TAS settings live **inside the game's own Settings page** (`installGameSettings`
 appends a "TAS Tool" section via MutationObserver: keybinds + **interface size** +
-speed units + **speed decimals** + panel layout + remember-editor + a "TAS
-leaderboard" subsection). `openGameSettings` opens it from anywhere via
+speed units + **speed decimals** + panel layout + remember-editor).
+`openGameSettings` opens it from anywhere via
 `__TAS_settings.make`.
 
 Persisted to `localStorage` `tas:settings` (`TAS.settings`, `saveSettings`). Defaults
 (`DEFAULT_SETTINGS`): keys `overlay:F8, panel:F9, reload:F7, settings:F6,
 savestate:F5, ssSet:F4, ssReturn:F3`; `units:kmh`; `rememberEditor:true`;
-`layout:tall`; `scale:1`; `speedDecimals:3`. (The board twin opens with **F2** per
-TASBOARD.md.) `installHotkeys` (capture-phase) dispatches; function keys/Escape still
-fire while typing.
+`layout:tall`; `scale:1`; `speedDecimals:3`. `installHotkeys` (capture-phase)
+dispatches; function keys/Escape still fire while typing.
 
 **Interface size (`settings.scale`, "Interface size" → 100–200%)** — `currentScale()`
 /`applyScale()` set CSS **`zoom`** on the TAS-owned HUDs: `TAS.overlay.el`,
 `TAS.posHUD.el` (positions HUD), and `TAS.panel.el` (toast, modals, game-settings
-host, the 3D canvas, and the leaderboard twin — which must match the game's own
-leaderboard — stay 1:1). `applyScale` is wired after `buildPositionsHUD()` so the
+host, and the 3D canvas stay 1:1). `applyScale` is wired after `buildPositionsHUD()` so the
 initial call already covers the HUD. `zoom` over `transform:scale` because
 Chromium reflows it (panel keeps fitting the viewport). Consequence: the **panel drag**
 divides mouse deltas by `currentScale()` (getBoundingClientRect is post-zoom;
@@ -434,7 +428,7 @@ via `window.__TAS_speedDecimals` (§ 12). Loader clamps to integer 0..5. Panel
 settings-handler only resets width/height on **tall↔wide layout change** (so changing
 size/units/decimals doesn't wipe a manual resize).
 
-Other `localStorage` keys: `tas:editor`, `tas:panelGeo`, plus board prefs.
+Other `localStorage` keys: `tas:editor`, `tas:panelGeo`.
 
 ---
 
@@ -455,11 +449,11 @@ else `capture.latest` for the active car.
 `window.__TAS__` (alias `window.TAS`): `version, gameVersion, bus, capture, savestate,
 bf, gate, settings, overlay, panel, parseCarState, Recording, compileScript,
 scriptToRecording, recordingToScript, compactScript, armSavestate, disarmSavestate,
-setTaint, bfStart, bfStop, bfBestText, bfExportSettings, bfImportSettings,
-openGameSettings, applyScale, inViewer, currentState, …` (plus board/HUD helpers).
+bfStart, bfStop, bfBestText, bfExportSettings, bfImportSettings,
+openGameSettings, applyScale, inViewer, currentState, …` (plus HUD helpers).
 
-`window` globals: `__TAS_tainted`, `__TAS_speedDecimals`, and the game-bundle
-exposures `__TAS_settings`, `__TAS_view`, `__TAS_viewState`, `__TAS_carThumb`.
+`window` globals: `__TAS_speedDecimals`, and the game-bundle exposures
+`__TAS_settings`, `__TAS_view`, `__TAS_viewState`, `__TAS_carThumb`.
 
 `window.electron`: `tasSaveRun(name,content)`, `tasReadRun(name)`, `tasListRuns()`.
 
@@ -479,7 +473,7 @@ exposures `__TAS_settings`, `__TAS_view`, `__TAS_viewState`, `__TAS_carThumb`.
   getBoundingClientRect, which is post-zoom).
 - After a version bump: re-verify § 3 and **diff `*.bundle.js` against `.orig`** to
   re-apply every game-bundle edit (base savestate/settings/viewer + the speedometer
-  hook + any board hooks).
+  hook + the main leaderboard integration).
 
 ---
 
@@ -487,6 +481,17 @@ exposures `__TAS_settings`, `__TAS_view`, `__TAS_viewState`, `__TAS_carThumb`.
 
 Append a line here when you change `tas.js`.
 
+- **Brute Force setup clarified.** The panel and user guide now say that this version
+  requires ordered trigger boxes; the old guide described a removed automatic
+  checkpoint/finish objective. Verified the in-game worker pipeline with one worker
+  and a bounded trigger: 586 completed variants and a best result in five seconds.
+- **All run modes use the main leaderboard.** Savestate finishes are no longer
+  filtered by elapsed wall time, and applying edited Watch inputs now simulates
+  and submits them through the same endpoint. Failed or incomplete savestate
+  recordings are reported instead of uploading a partial run.
+- **Main leaderboard only.** Savestate runs are no longer tainted or blocked from
+  upload; removed the separate TAS leaderboard code and its local-record suppression.
+  Live and simulated edited runs now submit through the main leaderboard path.
 - **Pipeline: never lose a finisher.** `tas/pipeline/src/cli/run.js` — when phase 3 exhausts its
   budget without finishing, it now falls back to the phase-2 RRT ghost (a complete run) instead
   of aborting with a partial, and a final guard keeps whichever finisher is fastest. Validated
@@ -515,8 +520,8 @@ Append a line here when you change `tas.js`.
   `tas-auto-start/stop/status` IPC + child management (artifacts under `userData/tas-auto/<runId>/`),
   `electron/preload.js` exposes `tasAutoStart/tasAutoStop/tasAutoStatus/onTasAutoLog/onTasAutoDone`.
   Requires a full game restart after updating the electron files, and the pipeline context to be
-  built once (`node src/extract/build-context.js` in `tas/pipeline`). Runs are `edited`-category
-  by definition; the upload gate/taint rules are unchanged.
+  built once (`node src/extract/build-context.js` in `tas/pipeline`). Runs are
+  submitted to the main leaderboard after simulation.
 
 - **Reset lag — the real cause was the capture tap (follow-up 5).** On a race reset the game
   re-simulates every ghost **through the sim worker**, which streams the whole trajectory back;

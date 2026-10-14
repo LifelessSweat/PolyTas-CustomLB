@@ -9,9 +9,9 @@ This is built in **phases** so each piece is testable before the next is added:
 
 | Phase | Status | Contents |
 |------:|:------:|----------|
-| **1** | ✅ | Worker-tap capture backbone · live speed + per-wheel grip overlay · input editor with `tap` · leaderboard gate |
+| **1** | ✅ | Worker-tap capture backbone · live speed + per-wheel grip overlay · input editor with `tap` · main leaderboard integration |
 | **2a** | ✅ | Bruteforce — parallel **stock-worker pool**, **checkpoint** + **trigger-box** objectives, evolutionary search |
-| **3** | ✅ this drop | **Savestate** — drive a run/replay from any frame **N** (upload blocked when N&gt;0) · TAS keybinds + options moved **into the game's own Settings page** · hotkey to open the game Settings **from anywhere** |
+| **3** | ✅ this drop | **Savestate** — drive a run/replay from any frame **N** and submit the finish to the main leaderboard · TAS keybinds + options moved **into the game's own Settings page** · hotkey to open the game Settings **from anywhere** |
 | 2b | later | Bruteforce **turbo** — custom worker with prefix snapshot + in-worker scoring (big speedup) |
 
 > **Heads-up (Phase 3):** unlike Phases 1–2a, Phase 3 makes **two small edits to
@@ -33,8 +33,7 @@ This is built in **phases** so each piece is testable before the next is added:
    ```
 
    > It must be **before** `main.bundle.js` and **not** `defer`red — the tool
-   > patches `window.Worker` and `XMLHttpRequest` before the game boots so it can
-   > observe the physics worker and gate uploads.
+   > patches `window.Worker` and observes leaderboard requests before the game boots.
 
 That's the entire install. To **port to a new version**, copy `tas/` over and
 re-apply that one line. See *Porting* below for the version-locked bits to check.
@@ -54,7 +53,6 @@ Hotkeys (all **rebindable** — see *Keybinds & settings* below — defaults sho
 |-----|--------|
 | **F8** | Toggle the telemetry **overlay** (top-right) — works everywhere |
 | **F9** | Toggle the **TAS panel** (viewer only) |
-| **F10** | Toggle the **leaderboard upload block** (the "tainted" flag) |
 | **F7** | **Reload** the viewed replay's inputs into the editor (viewer only) |
 | **F6** | Open the **game's Settings page** from anywhere |
 | **F5** | **Savestate** — drive this track from the replay's scrubbed frame (viewer only) |
@@ -62,7 +60,7 @@ Hotkeys (all **rebindable** — see *Keybinds & settings* below — defaults sho
 > **The editor / Apply / Brute Force / Savestate work only inside the standalone
 > Replays viewer** — open a leaderboard or PB replay via **Watch**; editing the
 > script edits *that* replay. The **telemetry overlay** is the only thing that
-> *also* works during live driving. (F8 / F6 / F10 work anywhere; F9 / F7 / F5
+> *also* works during live driving. (F8 / F6 work anywhere; F9 / F7 / F5
 > are viewer-only.)
 
 ### Keybinds & settings
@@ -132,7 +130,10 @@ viewed replay's inputs, discarding edits), **Compact** (shrink the script: dedup
 inputs: edit the loaded script, press **Apply → replay**, and the viewer reloads
 and plays your edited replay back. (It hands the game a copy of the loaded
 records with the focused replay's recording replaced by the editor's compiled
-recording, and re-enters the viewer so it preloads + re-simulates it.)
+recording, and re-enters the viewer so it preloads + re-simulates it.) The edited
+run is also simulated to the finish and submitted to the **main game leaderboard**
+using the same upload path as a live or savestate run; there is no separate TAS
+leaderboard.
 
 > Physics runs at a fixed **1 ms / frame (1000 fps)**, so "frame" numbers are
 > milliseconds of run time.
@@ -159,11 +160,11 @@ The panel's **Savestate** section:
 > recorded inputs to your keyboard. Everything before N is replayed identically;
 > everything after N is you.
 
-**Leaderboard safety:** a run started at **N&gt;0 is tainted** — the upload is
-**blocked** (the overlay border turns red, the panel's *Upload block* shows ON),
-while the **local PB + ghost still save** normally. N=0 is just a clean run from
-the start and uploads as usual. After a savestate run, toggle the upload block
-**off** (F10) when you want to set a real time again.
+Runs started at **N&gt;0** can still submit their finish to the main leaderboard.
+Live savestate finishes are submitted to the main game leaderboard automatically.
+In the replay viewer, **Apply → replay** also simulates the edited inputs and
+submits the resulting run to that same leaderboard. **Simulate finish → upload**
+remains available when you want to submit without applying the replay first.
 
 ## Brute Force (Phase 2a)
 
@@ -172,23 +173,25 @@ game's own physics workers and searches in parallel for inputs that best meet an
 objective. You **must enter a track and drive once first** so the tool has
 captured the track data.
 
-**Pick an objective:**
-- **Checkpoint / Finish** — reach the **Target** as early as possible. Target is
-  either `finish` or a number = *how many checkpoints to pass* (`1`, `2`, …).
-- **Trigger boxes** — drive the car **through one or more boxes in order**. Each
-  box is a small card: **center** X/Y/Z on one row, **size** X/Y/Z on the next,
-  and a **no-go** toggle + **Remove**. Add boxes by hand or click **+ at car** to
-  drop one at the car's current spot (works while driving **or** scrubbing a
-  replay). The **dist ↔ speed** slider blends *reach the box early* vs *carry speed
-  at the box*.
-  - **3D view** — boxes are drawn **in the game's own 3D scene** as a cyan
-    wireframe (green when the car is inside), always-on-top (x-ray). Toggle with
-    *Draw boxes in the game's 3D view*. This is done by recovering the camera
-    from THREE's shader uniforms and projecting onto an overlay — a best-effort
-    hook; if a future build's shaders differ it silently falls back to the map.
-  - **Minimap** — a top-down (X→ / Z↑) view under the boxes also draws each box +
-    the live car + a long trail, with a per-box `distance / INSIDE / speed`
-    readout.
+**Objective — ordered trigger boxes only.** There is no automatic checkpoint or
+finish target in this version. The search scores runs by reaching the boxes you
+place, so an empty box or a box in the wrong part of the track won't guide the
+search to the finish.
+
+1. Watch a replay or drive to the part of the track you want to target.
+2. Click **+ at car** to put a box at the current car position, or enter its
+   **center X/Y/Z** manually. Scrubbing a replay and clicking **+ at car** places
+   a box at that replay's scrubbed position.
+3. Set the box **size X/Y/Z** large enough to cover the racing line. Add multiple
+   boxes in the order you want the run to pass through them; use the last box for
+   the goal of this search window. Mark a box **no-go** to invalidate runs that
+   enter it.
+
+The **dist ↔ speed** slider blends *reach the next box early* vs *carry speed
+while approaching it*. A top-down minimap under the boxes shows each box, the car,
+its trail, and a per-box `distance / INSIDE / speed` readout. If enabled, the
+best-effort 3D overlay draws boxes in cyan (yellow while inside) and no-go boxes
+in red.
 
 **Search range** — `Start frame` / `End frame` is the `[start, end)` window the
 search is allowed to change; everything outside it is kept exactly as the base.
@@ -221,10 +224,10 @@ inputs into the editor.
 ## Phase 2a — what to verify in-game
 
 1. **Setup** — drive a track once (so track data is captured), then expand
-   **Brute Force**. With objective **Checkpoint/Finish**, target `finish`, a
-   sensible window (e.g. `0`–`2000`), click **Start BF**. The pill should show a
-   rising run count and **New Bests** should populate; **Best** shows
-   `reached @f…`. Lower frame = better.
+   **Brute Force**. Scrub a replay to a reachable spot, click **+ at car** to
+   create a goal box there, and set a search window (e.g. `0`–`2000`) that covers
+   the inputs leading to it. Click **Start BF**. The run count should rise and
+   **Best** should show progress such as `box 1/1 …` or `all 1 boxes …`.
 2. **Apply** — click **Apply best → editor**; the editor fills with the best
    inputs. (Verifying it *drives* in-game is Phase 3.)
 3. **Triggers** — switch to **Trigger boxes**, drive to a spot, **+ at car**,
@@ -250,11 +253,10 @@ inputs into the editor.
    you did. **Compact** then folds repeated alternations into `tap` macros.
    Open **⚙ Settings** and try rebinding a key (e.g. overlay → `Q`) and switching
    units to mph — both should take effect immediately and survive a reload.
-5. **Upload gate** — press **F10** (button shows "Upload block: ON", overlay
-   border turns red). Set a (slow, throwaway) PB on a track while blocked: the
-   local best/ghost should still save, but **no leaderboard entry appears**.
-   Turn it **OFF** and confirm a normal run *does* upload. (Use a sandbox/custom
-   track to avoid polluting a real board while testing.)
+5. **Leaderboard upload** — finish a live run (including one started with a
+   savestate) and confirm it appears on the main leaderboard. In the replay
+   viewer, edit the inputs and press **Apply → replay**; the edited run should
+   also appear on that same leaderboard.
 
 If any step fails, tell me what you saw — the likely culprits are the worker
 filename, the message field names, or the `CarState` layout, all of which are
@@ -279,10 +281,9 @@ build). It anchors only on **stable wire contracts**:
 - **Recording** codec (5 toggle channels → zlib → base64url) is byte-compatible
   with the game's, implemented with the browser-native `CompressionStream`
   (zero third-party code).
-- **Upload gate** drops the `POST` to `ptproxy.cwcinc.dev/.../leaderboard` (and the
-  `fetch` equivalent) while `window.__TAS_tainted` is set, synthesising a clean
-  empty response. Local saving happens before the network call, so PBs/ghosts
-  are unaffected.
+- **Main leaderboard integration** observes the game's leaderboard requests
+  without blocking them. Live runs use the game's normal upload flow; savestate
+  finishes and simulated edited runs submit to the same main leaderboard.
 - **Input shield** — the game's W/A/S/D handlers `preventDefault()` on those
   keys, which would swallow them when you type in the editor (and drive the car).
   A capture-phase key listener installed before the game `stopPropagation()`s
@@ -296,7 +297,7 @@ the marked sections:
 - `SIM_WORKER_FILE` (the physics worker filename).
 - The `CarState` field layout in `parseCarState` (re-verify offsets if Kodub
   changes the car model — only matters if the byte layout changes).
-- The leaderboard host/path match in `TAS.gate.isSubmitUrl`.
+- The leaderboard host/path match in `TAS.gate.isSubmit`.
 
 If physics changes (new car, new fields), the determinism shim and struct
 layout used by the Phase-2 bruteforce worker also need a re-check; the tool

@@ -17,7 +17,7 @@
  *   - the leaderboard host ptproxy.cwcinc.dev + "/leaderboard"
  *
  * Phase 2 (bruteforce) adds tas/tas-sim.worker.js + tas/vendor/determinism.js.
- * Phase 3 (savestate) adds the replay-drive + upload taint wiring.
+ * Phase 3 (savestate) adds replay-drive support.
  * ===================================================================== */
 (function () {
   "use strict";
@@ -517,13 +517,13 @@
    * recording up to frame N (budgeted per tick, so it's near-instant), then
    * switches to live ControlCar input — so you take over driving at frame N.
    *   - The game records the whole [0..end) run normally (local PB/ghost work).
-   *   - N>0 taints the run so the leaderboard upload is blocked (gate, §4).
+   *   - Runs still use the game's main leaderboard upload path.
    * SS is consumed one-shot by onOutbound (§3).
    * ================================================================== */
   var SS = TAS.savestate = { armed: false, frame: 0, prefixEncoded: null, label: "" };
 
   // Encode a prefix recording from editor text and arm the next run to start
-  // from frame N. Returns {ok, msg}. N>0 sets the upload taint.
+  // from frame N. Returns {ok, msg}.
   async function armSavestate(frame, text) {
     frame = Math.max(0, frame | 0);
     var rec = scriptToRecording(text || "");
@@ -531,16 +531,10 @@
     var enc;
     try { enc = await rec.serialize(); } catch (e) { return { ok: false, msg: "Failed to encode prefix recording: " + e }; }
     SS.frame = frame; SS.prefixEncoded = enc; SS.armed = true; SS.label = frame + "f"; SS._announced = false;
-    // Taint follows the savestate automatically: a start at frame N>0 can't be a
-    // legit time, so its leaderboard upload is blocked (no manual toggle).
-    setTaint(frame > 0);
     bus.emit("savestate", SS);
     return { ok: true };
   }
-  function disarmSavestate() { if (!SS.armed && SS.prefixEncoded == null) { setTaint(false); return; } SS.armed = false; SS.prefixEncoded = null; SS._announced = false; setTaint(false); bus.emit("savestate", SS); }
-  // Single source of truth for the upload-block flag + its visual indicator.
-  function setTaint(on) { window.__TAS_tainted = !!on; if (TAS.overlay) TAS.overlay.setTainted(!!on); }
-  TAS.setTaint = setTaint;
+  function disarmSavestate() { if (!SS.armed && SS.prefixEncoded == null) return; SS.armed = false; SS.prefixEncoded = null; SS._announced = false; bus.emit("savestate", SS); }
   TAS.armSavestate = armSavestate;
   TAS.disarmSavestate = disarmSavestate;
 
@@ -549,7 +543,7 @@
    * inputs up to here}. "Return to position" re-arms that as a savestate and
    * resets the run, so you fast-forward back to that exact spot/velocity — as
    * often as you like. Works from a legit run (frame 0) or an existing
-   * savestate; using a position taints the run (savestate-assisted). */
+   * savestate; any resulting run uses the main leaderboard upload path. */
   SS.points = []; // [{frame, prefixEncoded, label}]
 
   // Arm directly with an already-serialized prefix (start-positions path;
@@ -557,7 +551,6 @@
   function armSavestateRaw(frame, prefixEncoded) {
     frame = Math.max(0, frame | 0);
     SS.frame = frame; SS.prefixEncoded = prefixEncoded; SS.armed = true; SS.label = frame + "f"; SS._announced = false;
-    setTaint(frame > 0);
     bus.emit("savestate", SS);
   }
 
@@ -654,10 +647,6 @@
         // live keyboard control. NOT consumed: it re-applies on every reset, so
         // each Start-Reset drops you back at frame N. Disarmed when you return
         // to the viewer / main menu (installViewerContext).
-        // LEGIT = a clean run: created with NO savestate injection (and therefore
-        // from frame 0, no prefix). Only such runs may reach the official Kodub
-        // leaderboard; everything else (savestate / start-positions) stays blocked.
-        capture.legitRun = !(SS.armed && SS.prefixEncoded != null);
         if (SS.armed && SS.prefixEncoded != null) {
           msg.carRecording = SS.prefixEncoded;
           msg.tasSwitchFrame = SS.frame;
@@ -747,22 +736,12 @@
         capture._liveRunFrames = st.frames;
         if (st.hasStarted && !st.finished) capture.liveRecording.recordFrame(st.frames, st.controls);
         // Crossed the finish while LIVE DRIVING (legit OR savestate) → auto-post
-        // it to the TAS leaderboard as a "driven" run (the human never hand-edited
-        // inputs). Replay/Apply playback is excluded (different carId, not driving).
+        // it to the main leaderboard as a driven run. Replay/Apply playback is
+        // excluded (different carId, not driving).
         if (st.finished && st.finishFrames != null && !capture._finishUploaded && !inReplayViewer()) {
           capture._finishUploaded = true;
-          // A genuine live drive takes roughly real wall-clock time (the realtime
-          // loop is 1ms/frame). A SIMULATED/replayed run (flat-out) finishes far
-          // faster — that's what was wrongly uploading replays you raced against —
-          // so require the elapsed wall time to be near the driven-frame count.
-          var driveMs = perfNow() - (capture._playerBornTs || 0);
-          var liveFrames = st.finishFrames - (capture._ssRun ? (capture._ssRun.frame | 0) : 0);
-          if (driveMs >= liveFrames * 0.5) {
-            try { toast("Finished — full track time " + fmtTime(st.finishFrames)); } catch (e) {}
-            autoUploadDrivenFinish(st.finishFrames);
-          } else {
-            TAS.log("skipped auto-upload (simulated/replay: " + Math.round(driveMs) + "ms wall vs " + liveFrames + " frames)");
-          }
+          try { toast("Finished — full track time " + fmtTime(st.finishFrames)); } catch (e) {}
+          autoUploadDrivenFinish(st.finishFrames);
         }
       }
       bus.emit("carstate", st.carId, st);
@@ -843,21 +822,12 @@
   })();
 
   /* ================================================================== *
-   * 4. Leaderboard gate  —  block ALL official-leaderboard uploads
+   * 4. Main leaderboard observation
    * ------------------------------------------------------------------
-   * The tool NEVER uploads to PolyTrack's official leaderboard. Because it can
-   * drive savestate / TAS runs (and even a "legit" run is indistinguishable
-   * once the tool is installed), EVERY submit is blocked unconditionally — a
-   * clean "null" (uploadId=null) success is synthesized so the game's handler
-   * resolves normally and the LOCAL PB/ghost still save. Only the SUBMIT (POST)
-   * is blocked; the GET leaderboard READ (a ?query) is left alone so you can
-   * still VIEW the leaderboard. Every transport is covered (XHR / fetch /
-   * sendBeacon), and a submit is recognised by URL *or* its "recording=" body
-   * signature, so a version/path change can't slip a run through.
+   * Leave the game's leaderboard requests untouched. Observe their metadata so
+   * the TAS upload helper can use the same track and car details.
    * ================================================================== */
-  window.__TAS_tainted = window.__TAS_tainted || false;
   var gate = TAS.gate = {
-    blockedCount: 0,
     isSubmit: function (method, url, body) {
       if (String(method || "").toUpperCase() !== "POST") return false;
       var u = String(url || ""), host = "", path = u;
@@ -867,151 +837,85 @@
       try { if (typeof body === "string" && /(^|&)recording=/.test(body)) return true; } catch (e) {} // submit body signature
       return false;
     },
-    // The official Kodub leaderboard is allowed ONLY for a clean run: hand-driven
-    // from frame 0 with NO savestate / start-position / editor assistance. That's
-    // exactly capture.legitRun (set false the moment a savestate prefix is
-    // injected into the player car). Anything else stays blocked.
-    allowOfficial: function () { return capture.legitRun === true; }
   };
   (function patchUpload() {
-    function blocked(tag) { gate.blockedCount++; TAS.log("BLOCKED leaderboard upload (" + tag + " #" + gate.blockedCount + ")"); }
+    function observe(method, url, body) {
+      if (gate.isSubmit(method, url, body)) gate.captureRun(typeof body === "string" ? body : null);
+    }
     // ---- XHR ----
     var P = XMLHttpRequest.prototype, rOpen = P.open, rSend = P.send;
     P.open = function (method, url) { this.__tasM = method; this.__tasU = url; if (gate.noteUrl) gate.noteUrl(url); return rOpen.apply(this, arguments); };
     P.send = function (body) {
-      if (gate.isSubmit(this.__tasM, this.__tasU, body) && !gate.allowOfficial()) {
-        blocked("xhr");
-        gate.captureRun(typeof body === "string" ? body : null);
-        var xhr = this;
-        try {
-          Object.defineProperty(xhr, "readyState", { configurable: true, get: function () { return 4; } });
-          Object.defineProperty(xhr, "status", { configurable: true, get: function () { return 200; } });
-          Object.defineProperty(xhr, "responseText", { configurable: true, get: function () { return "null"; } });
-          Object.defineProperty(xhr, "response", { configurable: true, get: function () { return "null"; } });
-        } catch (e) {}
-        setTimeout(function () {
-          try { xhr.dispatchEvent(new Event("readystatechange")); } catch (e) {}
-          try { xhr.dispatchEvent(new Event("load")); } catch (e) {}
-          try { xhr.dispatchEvent(new Event("loadend")); } catch (e) {}
-        }, 0);
-        return;
-      }
+      observe(this.__tasM, this.__tasU, body);
       return rSend.apply(this, arguments);
     };
     // ---- fetch ----
     var rFetch = window.fetch;
     if (rFetch) {
       window.fetch = function (input, init) {
-        try {
-          var url = typeof input === "string" ? input : (input && input.url);
-          var method = (init && init.method) || (input && input.method) || "GET";
-          var body = init && init.body;
-          if (gate.noteUrl) gate.noteUrl(url);
-          if (gate.isSubmit(method, url, typeof body === "string" ? body : null) && !gate.allowOfficial()) {
-            blocked("fetch");
-            gate.captureRun(typeof body === "string" ? body : null);
-            return Promise.resolve(new Response("null", { status: 200, headers: { "Content-Type": "text/plain" } }));
-          }
-        } catch (e) {}
+        var url = typeof input === "string" ? input : (input && input.url);
+        var method = (init && init.method) || (input && input.method) || "GET";
+        var body = init && init.body;
+        if (gate.noteUrl) gate.noteUrl(url);
+        observe(method, url, typeof body === "string" ? body : null);
         return rFetch.apply(this, arguments);
       };
     }
-    // ---- sendBeacon (defense in depth; the game doesn't use it today) ----
-    try {
-      if (navigator && typeof navigator.sendBeacon === "function") {
-        var rBeacon = navigator.sendBeacon.bind(navigator);
-        navigator.sendBeacon = function (url, data) {
-          try { if (gate.isSubmit("POST", url, typeof data === "string" ? data : null) && !gate.allowOfficial()) { blocked("beacon"); gate.captureRun(typeof data === "string" ? data : null); return true; } } catch (e) {}
-          return rBeacon(url, data);
-        };
-      }
-    } catch (e) {}
   })();
 
   /* ================================================================== *
-   * 4a-bis. TAS Board  —  the SEPARATE community leaderboard.
+   * 4a-bis. Main leaderboard upload path.
    * ------------------------------------------------------------------
-   * The official board is hard-blocked above. Instead, finished runs are
-   * captured from the (blocked) submit body and routed to a Supabase-backed
-   * board that anyone can upload to / view, each run AUTO-TAGGED
-   * legit / savestate / tas with the full recording attached (re-watchable).
-   * Backend setup: tas/TASBOARD.md. The client talks to Supabase's REST API;
-   * Supabase isn't kodub.com so it sails through the upload gate untouched.
+   * Every TAS and savestate submission goes through the same endpoint as the
+   * game's main leaderboard.
    * ================================================================== */
-  // Built-in backend — embedded so the tool works for everyone out of the box
-  // (no per-person setup). This is a Supabase ANON public key; it's safe to ship
-  // because the table's RLS only allows read + insert (no update/delete). A user
-  // can still point at their OWN backend via the Configure form (overrides win).
-  var BOARD_URL = "https://edgeoqjhugjolbthkygg.supabase.co";
-  var BOARD_KEY = "sb_publishable_Ii3TbmPQ3vvoZ8exJbBi2A_b93cqWJ4";
-  var board = TAS.board = (function () {
-    function raw() { try { return JSON.parse(localStorage.getItem("tas:board") || "{}") || {}; } catch (e) { return {}; } }
-    // Effective config = embedded defaults overlaid with the user's overrides.
-    function cfg() {
-      var c = raw();
-      return {
-        url: c.url || BOARD_URL,
-        key: c.key || BOARD_KEY,
-        nickname: c.nickname || "",
-        autoUpload: c.autoUpload !== undefined ? !!c.autoUpload : true,
-        categoryOverride: c.categoryOverride || "auto"
-      };
-    }
-    function setCfg(c) { try { localStorage.setItem("tas:board", JSON.stringify(c || {})); } catch (e) {} bus.emit("board:cfg", c); }
-    function patchCfg(p) { var c = raw(); for (var k in p) c[k] = p[k]; setCfg(c); return c; }
-    function configured() { var c = cfg(); return !!(c.url && c.key); }
-    function base() { return String(cfg().url || "").replace(/\/+$/, ""); }
-    function api(pathAndQuery, opts) {
-      var c = cfg();
-      if (!c.url || !c.key) return Promise.reject(new Error("TAS Board not configured (set Project URL + anon key)."));
-      opts = opts || {};
-      var headers = { apikey: c.key, Authorization: "Bearer " + c.key };
-      for (var k in (opts.headers || {})) headers[k] = opts.headers[k];
-      var url = base() + "/rest/v1/" + pathAndQuery, method = opts.method || "GET", body = opts.body || null;
-      // Prefer the Electron main process (Node, no CORS / no Origin rewrite) so
-      // uploads aren't blocked by a preflight. Falls back to renderer fetch.
-      if (window.electron && typeof window.electron.tasBoardFetch === "function") {
-        return window.electron.tasBoardFetch(method, url, headers, body).then(function (r) {
-          var txt = (r && (r.text != null ? r.text : r.error)) || "";
-          return { ok: !!(r && r.ok), status: (r && r.status) || 0, text: function () { return Promise.resolve(txt); }, json: function () { try { return Promise.resolve(JSON.parse(txt || "null")); } catch (e) { return Promise.reject(e); } } };
-        });
+  var MAIN_LB_URL = "https://ptproxy.cwcinc.dev/leaderboard";
+  function submitOfficialRun(run) {
+    return new Promise(function (resolve) {
+      var userToken = gameUserToken();
+      var carStyle = run.car_style;
+      if (carStyle && typeof carStyle.serialize === "function") carStyle = carStyle.serialize();
+      else if (carStyle && typeof carStyle === "object") {
+        try { carStyle = JSON.stringify(carStyle); } catch (e) { carStyle = String(carStyle || ""); }
       }
-      opts.headers = headers;
-      return fetch(url, opts);
-    }
-    function upload(run) {
-      return api("runs", {
-        method: "POST",
-        headers: { "Content-Type": "application/json", Prefer: "return=minimal" },
-        body: JSON.stringify(run)
-      }).then(function (r) {
-        if (r.ok) return { ok: true };
-        return r.text().then(function (t) { return { ok: false, error: (t || ("HTTP " + r.status)) }; });
-      });
-    }
-    function fetchRuns(trackId, category, limit) {
-      var q = "runs?select=*&order=frames.asc&limit=" + (limit || 200);
-      if (trackId) q += "&track_id=eq." + encodeURIComponent(trackId);
-      if (category && category !== "all") q += "&category=eq." + encodeURIComponent(category);
-      return api(q).then(function (r) {
-        if (!r.ok) return r.text().then(function (t) { throw new Error(t || ("HTTP " + r.status)); });
-        return r.json();
-      });
-    }
-    // Upload only if it beats this user's current best for the same track+category
-    // (keeps the board to one row per person per category — their personal best).
-    function uploadIfBest(run) {
-      var q = "runs?select=frames&order=frames.asc&limit=1&track_id=eq." + encodeURIComponent(run.track_id) + "&category=eq." + encodeURIComponent(run.category);
-      q += run.user_id ? ("&user_id=eq." + encodeURIComponent(run.user_id)) : ("&nickname=eq." + encodeURIComponent(run.nickname || "anon"));
-      return api(q).then(function (r) { return r.ok ? r.json() : []; }).then(function (rows) {
-        var best = (rows && rows[0]) ? rows[0].frames : null;
-        if (best != null && run.frames >= best) return { uploaded: false, pb: false, prevBest: best };
-        return upload(run).then(function (res) { return res.ok ? { uploaded: true, pb: (best != null), prevBest: best } : { uploaded: false, error: res.error }; });
-      });
-    }
-    return { cfg: cfg, setCfg: setCfg, patchCfg: patchCfg, configured: configured, upload: upload, uploadIfBest: uploadIfBest, fetchRuns: fetchRuns };
-  })();
-
+      var body = "version=0.6.2" +
+        "&userToken=" + encodeURIComponent(String(userToken || TAS.userId || "")) +
+        "&nickname=" + encodeURIComponent(String(run.nickname || "anon")) +
+        ((run.country_code != null && String(run.country_code).length) ? ("&countryCode=" + encodeURIComponent(String(run.country_code))) : "") +
+        "&carStyle=" + encodeURIComponent(String(carStyle || "")) +
+        "&trackId=" + encodeURIComponent(String(run.track_id || "")) +
+        "&frames=" + encodeURIComponent(String(run.frames || 0)) +
+        "&recording=" + encodeURIComponent(String(run.recording || ""));
+      if (run.onlyVerified != null) body += "&onlyVerified=" + encodeURIComponent(String(run.onlyVerified));
+      var req = new XMLHttpRequest();
+      req.timeout = 20000;
+      req.overrideMimeType("text/plain");
+      req.onreadystatechange = function () {
+        if (req.readyState !== 4) return;
+        if (req.status !== 200) {
+          resolve({ ok: false, error: "HTTP " + req.status + " " + (req.responseText || "") });
+          return;
+        }
+        try {
+          var parsed = JSON.parse(req.responseText || "null");
+          if (parsed !== null && typeof parsed === "object" && ("uploadId" in parsed || "previousPosition" in parsed || "newPosition" in parsed)) {
+            resolve({ ok: true, payload: parsed });
+            return;
+          }
+          if (typeof parsed === "number" || parsed === null) {
+            resolve({ ok: true, payload: { uploadId: parsed } });
+            return;
+          }
+        } catch (e) {}
+        resolve({ ok: true, raw: req.responseText || "" });
+      };
+      req.onerror = function () { resolve({ ok: false, error: "network error" }); };
+      req.ontimeout = function () { resolve({ ok: false, error: "timeout" }); };
+      req.open("POST", MAIN_LB_URL, true);
+      req.setRequestHeader("Content-Type", "application/x-www-form-urlencoded; charset=UTF-8");
+      req.send(body);
+    });
+  }
   // Passively learn, from the (allowed) leaderboard GET, BOTH the current track
   // id (for the "this track" filter) AND the player's userTokenHash — the game's
   // own public, stable per-user id, which we credit/dedupe TAS runs by.
@@ -1027,13 +931,8 @@
     } catch (e) {}
   };
 
-  // Two categories only:
-  //   driven — the run was driven to the finish live (legit OR savestate); the
-  //            human never hand-edited inputs. Auto-uploaded on finish.
-  //   edited — the run includes at least one manually edited input (full TAS);
-  //            uploaded with the panel button.
-  // The official submit is captured ONLY for its metadata (car style); driven
-  // uploads are built from the live input stream when the car crosses the line.
+  // Capture official-submit metadata (car style, track id, nickname). TAS and
+  // savestate submissions use the same main leaderboard endpoint as game runs.
   gate.captureRun = function (body) {
     if (typeof body !== "string" || !body) return;
     try {
@@ -1042,47 +941,6 @@
       gate.lastRun = { track_id: p.get("trackId") || "", car_style: p.get("carStyle") || "", nickname: p.get("nickname") || "" };
     } catch (e) {}
   };
-
-  /* ================================================================== *
-   * 4a-ter. Block local PB persistence
-   * ------------------------------------------------------------------
-   * The official upload is blocked, but the game ALSO saves each finished run as
-   * a LOCAL record in localStorage (key "...record..._undeterministic_...",
-   * value {uploadId, tokenHash, frames, recording}). Because we blocked the
-   * upload, uploadId is null — so a NORMAL (un-patched) PolyTrack opened on the
-   * same profile later SYNCS that stored record to the official leaderboard,
-   * leaking a tool run. Fix: (a) drop writes to the record keys so nothing new is
-   * stored, and (b) purge already-stored, never-uploaded records on startup.
-   * ================================================================== */
-  (function blockLocalRecords() {
-    var RECORD_KEY = /^polytrack_.*_record_/;
-    try {
-      var proto = window.Storage && window.Storage.prototype;
-      if (proto && proto.setItem) {
-        var rawSet = proto.setItem;
-        proto.setItem = function (key, value) {
-          // Block the local PB record ONLY for non-legit runs (savestate/edited).
-          // A legit run uploads for real → its record carries a valid uploadId, so
-          // saving it is fine (a normal client won't re-sync it). A blocked run's
-          // record would have uploadId=null → a normal client would leak it.
-          try { if (RECORD_KEY.test(String(key)) && capture.legitRun !== true) { try { TAS.log("blocked local record save (non-legit run — would leak via a normal client): " + key); } catch (e) {} return; } } catch (e) {}
-          return rawSet.call(this, key, value);
-        };
-      }
-    } catch (e) {}
-    try {
-      var kill = [];
-      for (var i = 0; i < localStorage.length; i++) {
-        var k = localStorage.key(i);
-        if (!k || !RECORD_KEY.test(k)) continue;
-        var pending = true;
-        try { var v = JSON.parse(localStorage.getItem(k)); pending = !v || v.uploadId == null; } catch (e) { pending = true; }
-        if (pending) kill.push(k);
-      }
-      for (var j = 0; j < kill.length; j++) { try { localStorage.removeItem(kill[j]); } catch (e) {} }
-      if (kill.length) { try { TAS.log("purged " + kill.length + " un-uploaded local record(s) so a normal client can't sync them to the leaderboard."); } catch (e) {} }
-    } catch (e) {}
-  })();
 
   /* ================================================================== *
    * 4a-quater. Camera-matrix capture (for the 3D trigger-box overlay)
@@ -1174,7 +1032,7 @@
   (function installInputShield() {
     function inOurUI(node) {
       while (node) {
-        if (node.nodeType === 1 && (node.id === "tas-panel" || node.id === "tas-modal" || node.id === "tas-board")) return true;
+        if (node.nodeType === 1 && (node.id === "tas-panel" || node.id === "tas-modal")) return true;
         node = node.parentNode;
       }
       return false;
@@ -1818,11 +1676,11 @@
   function perfNow() { try { return performance.now(); } catch (e) { return 0; } }
 
   /* Headless: simulate ONE recording flat-out in a fresh stock worker and
-   * resolve its finish time. Used by the TAS Board to verify + time a full-TAS
-   * editor script before upload (a TAS run is never hand-driven, so the game
-   * never produces a submittable recording for it). Reuses the BF worker
+   * resolve its finish time before uploading an edited run (a TAS run is never
+   * hand-driven, so the game never produces a submittable recording for it).
+   * Reuses the BF worker
    * protocol; needs the captured track context (enter+drive the track once). */
-  function boardSimulateFinish(encoded, horizon) {
+  function simulateFinish(encoded, horizon) {
     return new Promise(function (resolve, reject) {
       if (!capture.init || !capture.lastCar || capture.lastCar.trackData == null) { reject(new Error("enter the track and drive once first (no captured track data yet)")); return; }
       var Real = capture._RealWorker || window.Worker, w;
@@ -1898,6 +1756,14 @@
     if (BF.running) return { ok: false, msg: "already running" };
     if (!capture.init || !capture.lastCar) return { ok: false, msg: "Enter a track and drive once first (need captured track data)." };
     var _allTrig = opts.triggers || [];
+    for (var ti = 0; ti < _allTrig.length; ti++) {
+      var box = _allTrig[ti];
+      if (!box || !isFinite(box.x) || !isFinite(box.y) || !isFinite(box.z) ||
+          !isFinite(box.sx) || !isFinite(box.sy) || !isFinite(box.sz) ||
+          box.sx === 0 || box.sy === 0 || box.sz === 0) {
+        return { ok: false, msg: "Every trigger/no-go box needs finite center coordinates and a non-zero size on X, Y, and Z." };
+      }
+    }
     BF.triggers = _allTrig.filter(function (t) { return !t.nogo; }); // ordered objective boxes
     BF.nogos = _allTrig.filter(function (t) { return t.nogo; });     // forbidden boxes
     BF.blend = opts.blend; BF.startFrame = opts.startFrame; BF.endFrame = opts.endFrame;
@@ -2035,7 +1901,7 @@
           '</div>' +
         '</details>' +
         '<details class="bfsec" open><summary>Objective — trigger boxes</summary>' +
-          '<div class="hint">Driven through <b>in order</b>: one box per checkpoint you care about + one on the finish line. Tick <b>no-go</b> to invalidate any run that enters a box.</div>' +
+          '<div class="hint">This search uses <b>trigger boxes only</b> (there is no automatic checkpoint/finish target). Set each box center and size, in order; put the last box on the goal you want to reach. Use <b>+ at car</b> while driving or watching a replay to place one. Tick <b>no-go</b> to invalidate runs entering a box.</div>' +
           '<div id="bf-triggers"></div>' +
           '<div class="mini"><button id="bf-tr-add">+ box</button><button id="bf-tr-atcar" title="Add a box at the car\'s current position (scrub a replay first)">+ at car</button></div>' +
           '<div class="trow"><span class="tlab">dist</span><input type="range" id="bf-blend" min="0" max="100" value="50" style="flex:1;width:auto"><span class="tlab">speed</span><span id="bf-blend-r" class="bfpill">50/50</span></div>' +
@@ -2504,7 +2370,7 @@
    * Electron main spawns it as a background Node process on the CURRENT
    * track's data (captured from the sim worker, same as Brute Force uses),
    * streams its log here, and the resulting script is loaded straight into
-   * the editor — Apply → replay to watch it, upload via the TAS board.
+   * the editor — Apply → replay watches it and submits it to the main leaderboard.
    * Requires the tas-auto-* bridge in electron/main.js + preload.js. */
   function buildAutoTas(panel) {
     var host = panel.body;
@@ -2650,14 +2516,15 @@
    * Launched FROM the replay viewer: scrub to frame N, then drop into LIVE
    * driving of the same track starting at frame N of the viewed replay. The
    * editor's current script is the prefix (your edits are honored), so the car
-   * re-simulates [0..N) then hands you control. N>0 taints the run (no upload). */
+   * re-simulates [0..N) then hands you control; the resulting run can upload
+   * through the main game leaderboard. */
   function buildSavestate(panel) {
     var host = panel.body;
     var el = document.createElement("div"); el.id = "tas-ss"; el.className = "collapsed";
     el.innerHTML =
       '<div class="sshead"><span class="chev">▸</span><b>Savestate</b><span class="sspill" id="ss-pill">idle</span></div>' +
       '<div class="ssbody">' +
-        '<div class="sub">Drive this track from frame N of the replay you\'re viewing. You arrive AT frame N with its exact momentum (the prefix [0..N) is re-simulated from the editor script — your edits count); drive to continue, and <b>Start-Reset returns you to frame N</b> each time. A start at N&gt;0 is tainted — finishing it will NOT upload.</div>' +
+        '<div class="sub">Drive this track from frame N of the replay you\'re viewing. You arrive AT frame N with its exact momentum (the prefix [0..N) is re-simulated from the editor script — your edits count); drive to continue, and <b>Start-Reset returns you to frame N</b> each time. Finishing uploads to the main leaderboard.</div>' +
         '<div class="grid">' +
           '<label>Frame N</label><div class="mini"><input id="ss-frame" type="number" value="0" min="0" style="flex:1"><button id="ss-now" title="Use the replay\'s current scrubbed frame">Use scrub frame</button></div>' +
         '</div>' +
@@ -2681,7 +2548,7 @@
       try {
         V.drive(V.trackMeta, V.trackData, V.category, V.records, null); // leave viewer, drive the same track
         setStatus(n > 0
-          ? "Driving this track — you arrive AT frame " + n + " (with its momentum); drive to continue, Start-Reset to return there. Finishing posts it to the TAS leaderboard as a driven run."
+          ? "Driving this track — you arrive AT frame " + n + " (with its momentum); drive to continue, Start-Reset to return there. Finishing posts it to the main leaderboard."
           : "Driving this track from the start.");
       } catch (e) { disarmSavestate(); setStatus("Couldn't start driving: " + e); }
     }
@@ -2787,12 +2654,7 @@
       container.appendChild(optRow("Speed decimals (overlay + game speedometer)", optButtons(currentSpeedDecimals(), [{ t: "0", v: 0 }, { t: "1", v: 1 }, { t: "2", v: 2 }, { t: "3", v: 3 }, { t: "4", v: 4 }, { t: "5", v: 5 }], function (v) { settings.speedDecimals = v; saveSettings(); })));
       container.appendChild(optRow("Panel layout", optButtons(settings.layout, [{ t: "Tall", v: "tall" }, { t: "Wide", v: "wide" }], function (v) { settings.layout = v; saveSettings(); })));
       container.appendChild(optRow("Remember editor across reloads", optButtons(settings.rememberEditor ? "y" : "n", [{ t: "On", v: "y" }, { t: "Off", v: "n" }], function (v) { settings.rememberEditor = (v === "y"); saveSettings(); })));
-      var hb = document.createElement("h3"); hb.textContent = "TAS leaderboard"; container.appendChild(hb);
-      container.appendChild(optRow("Auto-upload finished runs", optButtons(board.cfg().autoUpload ? "y" : "n", [{ t: "On", v: "y" }, { t: "Off", v: "n" }], function (v) { board.patchCfg({ autoUpload: (v === "y") }); })));
-      var nnRow = document.createElement("div"); nnRow.className = "setting";
-      var nnP = document.createElement("p"); nnP.textContent = "Upload name"; nnRow.appendChild(nnP);
-      var nnV = document.createElement("p"); nnV.style.opacity = ".6"; nnV.textContent = uploadNickname(); nnRow.appendChild(nnV);
-      container.appendChild(nnRow);
+      // TAS run uploads go directly to the main PolyTrack leaderboard.
     }
     function scan() {
       var cs = document.querySelectorAll(".settings-menu-ui > .container");
@@ -2892,15 +2754,41 @@
     } catch (e) { TAS.log("savestate→editor transfer failed: " + e); return false; }
   }
 
-  // Auto-post a just-finished LIVE-DRIVEN run (legit or savestate) to the TAS
-  // leaderboard as "driven", credited to the player's userTokenHash, only if it
-  // beats their existing best for this track. The recording is the full run
-  // (legit = the reconstructed live inputs; savestate = prefix + live merged).
+  // Auto-post a just-finished LIVE-DRIVEN run (legit or savestate) to the main
+  // leaderboard as "driven". The recording is the full run (legit = the
+  // reconstructed live inputs; savestate = prefix + live merged).
   async function autoUploadDrivenFinish(finishFrames) {
-  // Event build: savestate runs use the game's left leaderboard.
-  // The game's normal leaderboard request is allowed by gate.allowOfficial().
-  return;
-}
+    try {
+      var trackId = TAS.currentTrackId || (gate.lastRun && gate.lastRun.track_id);
+      if (!trackId) { TAS.log("auto-upload failed: track id is unknown"); toast("Finished, but the main leaderboard upload failed: track id is unknown."); return; }
+      var rec = capture.liveRecording && capture.liveRecording.clone ? capture.liveRecording.clone() : new Recording();
+      if (capture._ssRun && capture._ssRun.prefix) {
+        try { rec = await ssMergeRecording(capture._ssRun.prefix, capture.liveRecording || new Recording(), capture._ssRun.frame | 0); }
+        catch (e) { TAS.log("savestate merge failed for auto upload: " + e); toast("Savestate run finished, but its full recording could not be prepared for upload."); return; }
+      }
+      if (!rec || !rec.numberOfInputs || rec.numberOfInputs() < 1) { TAS.log("auto-upload failed: run recording is empty"); toast("Finished, but the main leaderboard upload failed: run recording is empty."); return; }
+      var enc = await rec.serialize();
+      var run = {
+        track_id: trackId,
+        frames: finishFrames,
+        recording: enc,
+        car_style: (gate.lastRun && gate.lastRun.car_style) || capture.carStyle || "",
+        nickname: uploadNickname(),
+        user_id: TAS.userId || null,
+        country_code: gameCountryCode(),
+        onlyVerified: false
+      };
+      var res = await submitOfficialRun(run);
+      if (res && res.ok) {
+        TAS.log("auto-uploaded driven run: " + finishFrames + " frames on track " + trackId);
+        toast("Run uploaded to the main leaderboard — " + fmtTime(finishFrames));
+      }
+      else { TAS.log("auto-upload failed: " + (res && res.error || res)); toast("Main leaderboard upload failed: " + (res && res.error || "unknown error")); }
+    } catch (e) {
+      TAS.log("auto-upload exception: " + e);
+      toast("Main leaderboard upload failed: " + e);
+    }
+  }
 
   function installViewerContext() {
     var wasIn = false, stableMiss = 0, menuWas = false;
@@ -2943,9 +2831,40 @@
     setInterval(function () { if (wasIn && !traf) traf = requestAnimationFrame(poll); }, 50);
   }
 
-  /* ---- Game nickname (for crediting TAS Board uploads) ----
-   * The community board has no accounts; runs are credited to your PolyTrack
-   * nickname, read from the game's own user record in localStorage. */
+  /* ---- Game profile data (for official leaderboard uploads) ----
+   * The main leaderboard uses the raw account token plus the current profile's
+   * nickname/car style, so read the same values directly from the game's own
+   * localStorage profile blobs. */
+  function gameUserToken() {
+    try {
+      var keys = Object.keys(localStorage), slotKey = null, i;
+      for (i = 0; i < keys.length; i++) if (/polytrack.*_user_slot$/.test(keys[i])) slotKey = keys[i];
+      var rec = null;
+      if (slotKey) { var slot = localStorage.getItem(slotKey); rec = localStorage.getItem(slotKey.slice(0, -4) + slot); }
+      if (!rec) for (i = keys.length - 1; i >= 0; i--) if (/polytrack.*_user_\d+$/.test(keys[i])) { rec = localStorage.getItem(keys[i]); break; }
+      if (rec) {
+        var o = JSON.parse(rec);
+        var token = (o && o.token) || (o && o.settings && o.settings.token) || null;
+        if (token) return String(token);
+      }
+    } catch (e) {}
+    return null;
+  }
+  function gameCountryCode() {
+    try {
+      var keys = Object.keys(localStorage), slotKey = null, i;
+      for (i = 0; i < keys.length; i++) if (/polytrack.*_user_slot$/.test(keys[i])) slotKey = keys[i];
+      var rec = null;
+      if (slotKey) { var slot = localStorage.getItem(slotKey); rec = localStorage.getItem(slotKey.slice(0, -4) + slot); }
+      if (!rec) for (i = keys.length - 1; i >= 0; i--) if (/polytrack.*_user_\d+$/.test(keys[i])) { rec = localStorage.getItem(keys[i]); break; }
+      if (rec) {
+        var o = JSON.parse(rec);
+        var cc = (o && o.settings && o.settings.countryCode) || (o && o.countryCode) || null;
+        if (cc) return String(cc);
+      }
+    } catch (e) {}
+    return null;
+  }
   function gameNickname() {
     try {
       var keys = Object.keys(localStorage), slotKey = null, i;
@@ -2957,132 +2876,7 @@
     } catch (e) {}
     return null;
   }
-  function uploadNickname() { return gameNickname() || (board.cfg().nickname) || "anon"; }
-
-  /* ---- Native twin leaderboard ----
-   * Whenever the game shows its real `.leaderboard-ui`, dock an identical-looking
-   * TAS leaderboard right beside it (reusing the game's own CSS classes so it's
-   * pixel-native). It tracks the same track id the game just queried, and offers
-   * Legit / Savestate / TAS tabs. Built entirely from the game's markup. */
-  function lbOrdinalSuffix(n) { var s = ["th", "st", "nd", "rd"], v = n % 100; return s[(v - 20) % 10] || s[v] || s[0]; }
-  function lbOrdinal(n) { return n + lbOrdinalSuffix(n); }
-  function lbTime(frames) {
-    frames = Math.max(0, frames | 0);
-    var ms = frames % 1000, t = (frames - ms) / 1000, sec = t % 60, min = (t - sec) / 60;
-    var mm = ("000" + ms).slice(-3);
-    return (min > 0 ? (min + ":" + (sec < 10 ? "0" : "") + sec) : ("" + sec)) + "." + mm;
-  }
-  function lbEntryEl(rank, r) {
-    var b = document.createElement("button"); b.className = "main"; b.type = "button";
-    var ic = document.createElement("div"); ic.className = "image-container";
-    var im = document.createElement("img"); im.className = "show"; im.src = "images/car_thumbnail_placeholder.png"; ic.appendChild(im); b.appendChild(ic);
-    // Render the run's real car skin via the game's own thumbnail renderer
-    // (hooked in main.bundle.js); falls back to the placeholder above.
-    if (r.car_style && typeof window.__TAS_carThumb === "function") {
-      try { var pr = window.__TAS_carThumb(r.car_style); if (pr && pr.then) pr.then(function (src) { if (src) im.src = src; }).catch(function () {}); } catch (e) {}
-    }
-    var left = document.createElement("div"); left.className = "left";
-    var pos = document.createElement("p"); pos.className = "position";
-    pos.appendChild(document.createTextNode(String(rank)));
-    var suf = document.createElement("span"); suf.textContent = lbOrdinalSuffix(rank); pos.appendChild(suf); // native faded suffix style
-    left.appendChild(pos); b.appendChild(left);
-    var right = document.createElement("div"); right.className = "right";
-    var nc = document.createElement("div"); nc.className = "name-container";
-    var nm = document.createElement("span"); nm.className = "name"; nm.textContent = r.nickname || "anon"; nc.appendChild(nm);
-    right.appendChild(nc);
-    var tg = document.createElement("span"); tg.className = "tas-lb-tag tag-" + (r.category || ""); tg.textContent = r.category || ""; right.appendChild(tg);
-    var tm = document.createElement("p"); tm.className = "tas-lb-time"; tm.textContent = lbTime(r.frames); right.appendChild(tm);
-    b.appendChild(right);
-    b.title = (r.nickname || "anon") + " · " + (r.category || "") + " · " + lbTime(r.frames) + "  (click to load into the editor)";
-    b.onclick = function () { lbLoadIntoEditor(r); };
-    return b;
-  }
-  async function lbLoadIntoEditor(r) {
-    try { if (!TAS.panel) return; var rec = await Recording.deserialize(r.recording); TAS.panel.setEditor(recordingToScript(rec)); toast("Loaded " + (r.category || "") + " run (" + lbTime(r.frames) + ") into the editor."); }
-    catch (e) { toast("Couldn't decode that run: " + e); }
-  }
-  // Rows arrive sorted by time; keep each player's BEST per category (one row per
-  // person), so the board is a clean leaderboard even though every PB is stored.
-  function dedupeBestPerUser(rows) {
-    var seen = {}, out = [];
-    for (var i = 0; i < rows.length; i++) {
-      var r = rows[i];
-      var who = r.user_id ? ("u:" + r.user_id) : ("n:" + String(r.nickname || "anon").toLowerCase());
-      var key = who + "|" + (r.category || "");
-      if (seen[key]) continue; seen[key] = 1; out.push(r);
-    }
-    return out;
-  }
-
-  function installLeaderboardTwin() {
-    var TWIN = "tas-lb", filterTag = "all", twin = null, lastTrack = null;
-    function buildTwin() {
-      var el = document.createElement("div"); el.className = "leaderboard-ui " + TWIN;
-      var h2 = document.createElement("h2"); h2.textContent = "TAS Leaderboard"; el.appendChild(h2);
-      var h3 = document.createElement("h3"); h3.className = "tas-lb-sub"; h3.textContent = "driven & input-edited runs · best per player"; el.appendChild(h3);
-      var tabs = document.createElement("div"); tabs.className = "pages tas-lb-tabs";
-      [["all", "All"], ["driven", "Driven"], ["edited", "Edited"]].forEach(function (t) {
-        var b = document.createElement("button"); b.className = "page" + (t[0] === filterTag ? " selected" : ""); b.type = "button"; b.textContent = t[1]; b.dataset.tag = t[0];
-        b.onclick = function () { filterTag = t[0]; Array.prototype.forEach.call(tabs.children, function (c) { c.classList.toggle("selected", c.dataset.tag === filterTag); }); load(); };
-        tabs.appendChild(b);
-      });
-      el.appendChild(tabs);
-      var cont = document.createElement("div"); cont.className = "container"; el.appendChild(cont);
-      el._cont = cont;
-      return el;
-    }
-    function setMsg(m) { if (twin) { twin._cont.textContent = ""; var p = document.createElement("p"); p.className = "error-message"; p.textContent = m; twin._cont.appendChild(p); } }
-    function load() {
-      if (!twin) return;
-      var trackId = TAS.currentTrackId;
-      if (!trackId) { setMsg("Waiting for the track…"); return; }
-      lastTrack = trackId;
-      setMsg("Loading…");
-      board.fetchRuns(trackId, filterTag, 200).then(function (rows) {
-        if (!twin) return;
-        rows = dedupeBestPerUser(rows || []);
-        twin._cont.textContent = "";
-        if (!rows.length) { setMsg("No TAS runs yet for this track" + (filterTag !== "all" ? " (" + filterTag + ")" : "") + "."); return; }
-        rows.forEach(function (r, i) { twin._cont.appendChild(lbEntryEl(i + 1, r)); });
-      }).catch(function (e) { setMsg("Couldn't load: " + (e && e.message || e)); });
-    }
-    function findGameLB() {
-      var all = document.querySelectorAll(".leaderboard-ui:not(." + TWIN + ")");
-      for (var i = 0; i < all.length; i++) { var n = all[i]; if (n.offsetParent !== null || n.getClientRects().length) return n; }
-      return all[0] || null;
-    }
-    function dock() {
-      var lb = findGameLB();
-      if (!lb) { undock(); return; }
-      if (twin && twin.previousElementSibling === lb) { if (TAS.currentTrackId !== lastTrack) load(); return; } // already docked, refresh on track change
-      undock();
-      twin = buildTwin();
-      lb.insertAdjacentElement("afterend", twin);
-      // The leaderboard column is flex-shrink:0/600px → its parent is a flex row,
-      // so the twin sits beside it. If not flex (defensive), make it so.
-      var p = lb.parentElement;
-      if (p && getComputedStyle(p).display.indexOf("flex") < 0) { p.dataset.tasFlexed = p.getAttribute("style") || ""; p.style.display = "flex"; p.style.flexDirection = "row"; p.style.justifyContent = "center"; p.style.alignItems = "stretch"; }
-      load();
-    }
-    function undock() {
-      if (!twin) return;
-      var p = twin.parentElement;
-      try { twin.remove(); } catch (e) {}
-      twin = null;
-      if (p && p.dataset && p.dataset.tasFlexed !== undefined) { if (p.dataset.tasFlexed) p.setAttribute("style", p.dataset.tasFlexed); else p.removeAttribute("style"); delete p.dataset.tasFlexed; }
-    }
-    // Watch the DOM for the game's leaderboard appearing / disappearing
-    // (debounced — the callback runs at most once per frame).
-    var pend = false;
-    function react() { pend = false; if (findGameLB()) dock(); else undock(); }
-    var mo = new MutationObserver(function () { if (pend) return; pend = true; (window.requestAnimationFrame || setTimeout)(react, 0); });
-    try { mo.observe(document.body, { childList: true, subtree: true }); } catch (e) {}
-    // New track queried → if docked, refresh to that track.
-    bus.on("track", function () { if (twin) load(); });
-    // Initial pass (in case a leaderboard is already on screen).
-    setTimeout(function () { if (findGameLB()) dock(); }, 600);
-    return { dock: dock, undock: undock, refresh: load };
-  }
+  function uploadNickname() { return gameNickname() || "anon"; }
 
   /* ---- Savestate positions HUD (shown WHILE DRIVING) ----
    * A small box with Set/Go/Delete for in-run start positions. Visible only on
@@ -3163,7 +2957,6 @@
     TAS.autoUI = buildAutoTas(TAS.panel);   // autonomous pipeline (tas/pipeline) front-end
     TAS.posHUD = buildPositionsHUD();  // in-run savestate positions (driving aid)
     applyScale(); bus.on("settings", applyScale);   // global UI size (overlay + panel + positions HUD)
-    TAS.lbTwin = installLeaderboardTwin(); // native TAS leaderboard docked beside the real one
     installGameSettings();   // TAS keybinds + options live inside the game's own settings page
     installViewerContext();  // panel/editor/BF/apply/savestate are replay-viewer-only
     installRendererBoxOverlay();
@@ -3202,9 +2995,6 @@
       "#tas-overlay .cmp-row.me .cl{color:#7ad7ff;font-weight:700}" +
       "#tas-overlay .cmp-row.me .ct,#tas-overlay .cmp-row.me .cs{color:#7ad7ff}" +
       "#tas-overlay .tas-hdr{display:flex;justify-content:space-between;align-items:center;margin-bottom:4px;font-size:10px;color:#7c7c92;text-transform:uppercase;letter-spacing:.5px}" +
-      "#tas-overlay.tainted{border-color:#a04240}" +
-      "#tas-overlay .tas-taint{color:#ff8a8a;font-size:10px;margin-top:5px;display:none}" +
-      "#tas-overlay.tainted .tas-taint{display:block}" +
       "#tas-panel{position:fixed;box-sizing:border-box;top:8px;left:8px;z-index:2147483645;width:360px;height:min(82vh,720px);min-width:300px;min-height:150px;max-width:97vw;max-height:97vh;display:flex;flex-direction:column;overflow:hidden;font:12px ui-monospace,Consolas,Menlo,monospace;color:#e6e6ee;background:rgba(18,18,28,.96);border:1px solid #2a2a3a;border-radius:10px;box-shadow:0 8px 30px rgba(0,0,0,.5)}" +
       "#tas-panel.wide{width:min(720px,97vw)}" +
       "#tas-panel.wide .pb{flex-flow:row wrap;align-content:flex-start}" +
@@ -3277,58 +3067,6 @@
       "#tas-pos .poslab{flex:1;font-size:11px;color:#cfcfe0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}" +
       "#tas-pos .posempty{font-size:10px;color:#7c7c92;padding:2px}" +
       "#tas-pos .poshint{font-size:10px;color:#7c7c92}" +
-      // TAS Board overlay
-      "#tas-board{position:fixed;top:6vh;left:50%;transform:translateX(-50%);z-index:2147483645;width:min(520px,94vw);max-height:88vh;display:flex;flex-direction:column;font:12px ui-monospace,Consolas,monospace;color:#e6e6ee;background:rgba(16,16,24,.98);border:1px solid #2a2a3a;border-radius:12px;box-shadow:0 16px 60px rgba(0,0,0,.6);overflow:hidden}" +
-      "#tas-board .bh{display:flex;align-items:center;gap:8px;padding:8px 12px;background:#20202c;border-bottom:1px solid #2a2a3a}" +
-      "#tas-board .bh b{font-size:13px}" +
-      "#tas-board .bh .sp{flex:1}" +
-      "#tas-board .bpill{font-size:10px;padding:2px 7px;border-radius:9px;background:#2a2a3a;color:#9ad}" +
-      "#tas-board .bh button{padding:2px 9px;background:#2a2a3a;color:#e6e6ee;border:1px solid #3a3a4a;border-radius:6px;cursor:pointer;font-size:14px}" +
-      "#tas-board .bb{padding:10px;display:flex;flex-direction:column;gap:8px;overflow:auto}" +
-      "#tas-board details{background:#191922;border:1px solid #2a2a3a;border-radius:8px;padding:4px 8px}" +
-      "#tas-board summary{cursor:pointer;color:#bcbccc;font-size:11px;padding:2px 0}" +
-      "#tas-board .bcfg{display:grid;grid-template-columns:auto 1fr;gap:6px 8px;align-items:center;padding:6px 2px 2px}" +
-      "#tas-board .bcfg label{font-size:11px;color:#9aa}" +
-      "#tas-board .bcfg .ck{display:flex;align-items:center;gap:6px;color:#ccd}" +
-      "#tas-board .bcfg input[type=text],#tas-board .bcfg input:not([type]),#tas-board .bcfg select{grid-column:2}" +
-      "#tas-board input,#tas-board select{background:#0e0e16;color:#e6e6ee;border:1px solid #33334a;border-radius:6px;padding:4px 6px;font:11px ui-monospace,Consolas,monospace}" +
-      "#tas-board .brow{grid-column:1/3;display:flex;align-items:center;gap:8px;margin-top:4px}" +
-      "#tas-board .bhint,#tas-board .bstatus{font-size:10px;color:#7c7c92}" +
-      "#tas-board button{background:#2a2a3a;color:#e6e6ee;border:1px solid #3a3a4a;border-radius:6px;padding:4px 9px;font:11px ui-monospace,Consolas,monospace;cursor:pointer}" +
-      "#tas-board button:hover{background:#33334a}" +
-      "#tas-board button.go{background:#1ea3c4;border-color:#1ea3c4;color:#06222a;font-weight:bold}" +
-      "#tas-board button.btn-min{padding:2px 7px;color:#9aa}" +
-      "#tas-board .btool{display:flex;gap:6px;flex-wrap:wrap;align-items:center}" +
-      "#tas-board .blist{display:flex;flex-direction:column;gap:3px;min-height:40px}" +
-      "#tas-board .brow2{display:flex;align-items:center;gap:8px;padding:4px 6px;background:#191922;border:1px solid #23232f;border-radius:7px}" +
-      "#tas-board .brank{width:30px;color:#7c7c92;font-size:11px}" +
-      "#tas-board .btime{width:78px;font-weight:bold;color:#eaeaf4}" +
-      "#tas-board .catb{font-size:10px;padding:1px 6px;border-radius:8px;font-weight:bold;text-transform:uppercase}" +
-      "#tas-board .bwho{flex:1;color:#bcbccc;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}" +
-      "#tas-board .bact{display:flex;gap:4px}" +
-      "#tas-board .bempty{color:#7c7c92;font-size:11px;padding:6px 2px}" +
-      // native twin leaderboard (reuses the game's .leaderboard-ui look). The game
-      // root (#ui) is pointer-events:none, so re-enable it for the whole twin, and
-      // give entries/tabs an explicit dark background (text is --text-color #fff).
-      ".leaderboard-ui.tas-lb{margin-left:20px;pointer-events:auto}" +
-      ".leaderboard-ui.tas-lb *{pointer-events:auto}" +
-      ".leaderboard-ui.tas-lb > h2{color:#7ad7ff}" +
-      ".leaderboard-ui.tas-lb > .tas-lb-sub{margin:0 10px 10px 10px;font-size:18px;text-align:center;opacity:.5}" +
-      ".leaderboard-ui.tas-lb > .tas-lb-tabs{margin:10px 10px 10px 10px;gap:6px}" +
-      ".leaderboard-ui.tas-lb > .tas-lb-tabs > button.page{padding:8px 0;flex:1 1 0;width:auto;background-color:var(--button-color);color:var(--text-color);border:none;font-size:18px;cursor:pointer}" +
-      ".leaderboard-ui.tas-lb > .tas-lb-tabs > button.page:hover{background-color:var(--button-hover-color)}" +
-      ".leaderboard-ui.tas-lb > .tas-lb-tabs > button.page.selected{background-color:var(--button-hover-color)}" +
-      ".leaderboard-ui.tas-lb .main{display:flex;align-items:center;gap:0;cursor:pointer;background-color:var(--button-color);color:var(--text-color)}" +
-      ".leaderboard-ui.tas-lb .main:hover{background-color:var(--button-hover-color)}" +
-      ".leaderboard-ui.tas-lb .main > .image-container{flex:0 0 100px}" +
-      ".leaderboard-ui.tas-lb .main > .left{flex:0 0 auto;display:flex;align-items:center}" +
-      ".leaderboard-ui.tas-lb .main > .left > .position{color:var(--text-color)}" +
-      ".leaderboard-ui.tas-lb .main > .right{flex:1 1 auto;display:flex;align-items:center;gap:10px;min-width:0;width:auto}" +
-      ".leaderboard-ui.tas-lb .main > .right > .name-container > .name{color:var(--text-color)}" +
-      ".leaderboard-ui.tas-lb .main > .right > .tas-lb-time{margin:0;padding:0 14px 0 0;font-size:28px;white-space:nowrap;color:var(--text-color)}" +
-      ".leaderboard-ui.tas-lb .tas-lb-tag{flex:0 0 auto;font-size:12px;font-weight:bold;text-transform:uppercase;padding:3px 8px;border-radius:9px;color:#06222a}" +
-      ".leaderboard-ui.tas-lb .tas-lb-tag.tag-driven{background:#39d98a}" +
-      ".leaderboard-ui.tas-lb .tas-lb-tag.tag-edited{background:#7aa2ff}" +
       // bruteforce section
       "#tas-bf{border-top:1px solid #2a2a3a;margin-top:4px;padding-top:8px;display:flex;flex-direction:column;gap:8px}" +
       "#tas-bf .bfhead{display:flex;align-items:center;gap:8px;cursor:pointer}" +
@@ -3562,7 +3300,7 @@
       '<div class="tas-grip">' + wheelHtml + '</div>' +
       '<div class="tas-keys"><span data-k="w">W</span><span data-k="a">A</span><span data-k="s">S</span><span data-k="d">D</span><span data-k="r">R</span></div>' +
       '<div class="tas-cmp" style="display:none"></div>' +
-      '<div class="tas-taint">⛔ upload blocked (tainted run)</div>';
+      '';
     document.body.appendChild(el);
 
     var q = function (s) { return el.querySelector(s); };
@@ -3614,7 +3352,6 @@
     return {
       el: el,
       toggle: function () { el.classList.toggle("tas-hidden"); if (!el.classList.contains("tas-hidden") && last && !raf) raf = requestAnimationFrame(render); },
-      setTainted: function (t) { el.classList.toggle("tainted", !!t); }
     };
   }
 
@@ -3648,10 +3385,10 @@
           '<button id="tas-clear" class="warn">Clear</button>' +
         '</div>' +
         '<div class="row">' +
-          '<button id="tas-apply" class="go" title="Re-simulate the viewed replay with your editor inputs — watch your edits play back in the viewer">Apply → replay</button>' +
+          '<button id="tas-apply" class="go" title="Re-simulate the viewed replay with your editor inputs and submit the run to the main leaderboard">Apply → replay</button>' +
         '</div>' +
         '<div class="row">' +
-          '<button id="tas-uptas" class="go" title="Simulate the editor inputs to the finish line, read the finish time, and post it to the TAS leaderboard as a full-TAS run">Simulate finish → upload TAS</button>' +
+          '<button id="tas-uptas" class="go" title="Simulate the editor inputs to the finish line, read the finish time, and post it to the main leaderboard">Simulate finish → upload</button>' +
         '</div>' +
         '<div class="status" id="tas-status">Open a replay (Watch) — its inputs load here; edit them, then Apply.</div>' +
       '</div>';
@@ -3731,6 +3468,34 @@
 
     function setEditor(v) { editor.value = v; if (settings.rememberEditor) { try { localStorage.setItem("tas:editor", v); } catch (e) {} } }
 
+    var editedUploadBusy = false;
+    async function simulateAndUploadEdited(rec, enc) {
+      var btn = $("tas-uptas");
+      if (editedUploadBusy) { setStatus("An edited run is already being uploaded."); return; }
+      if (!capture.init || !capture.lastCar || capture.lastCar.trackData == null) { setStatus("No track loaded yet — open a replay (Watch) on this track first so the tool captures it."); return; }
+      var trackId = TAS.currentTrackId || (gate.lastRun && gate.lastRun.track_id);
+      if (!trackId) { setStatus("Track id unknown — open this track's leaderboard once (the game then tells the tool its id), then retry."); return; }
+      editedUploadBusy = true;
+      btn.disabled = true;
+      try {
+        setStatus("Simulating the edited inputs to the finish line…");
+        var horizon = Math.min(Recording.MAX_FRAMES, rec.numberOfFrames() + 30000);
+        var fin;
+        try { fin = await simulateFinish(enc, horizon); }
+        catch (e) { setStatus("These inputs don't reach the finish — " + e.message + ". (The run must cross the finish line to be timed.)"); return; }
+        var run = { track_id: trackId, frames: fin.finishFrames, recording: enc, car_style: (gate.lastRun && gate.lastRun.car_style) || capture.carStyle || "", nickname: uploadNickname(), user_id: TAS.userId || null, country_code: gameCountryCode(), onlyVerified: false };
+        setStatus("Finishes at " + fmtTime(fin.finishFrames) + " — posting to the main leaderboard…");
+        var res = await submitOfficialRun(run);
+        if (res.ok) setStatus("Posted edited run — " + fmtTime(fin.finishFrames) + " as “" + run.nickname + "” to the main leaderboard.");
+        else setStatus("Simulated OK (" + fmtTime(fin.finishFrames) + ") but upload was rejected: " + res.error);
+      } catch (e) {
+        setStatus("Edited run upload failed: " + e);
+      } finally {
+        editedUploadBusy = false;
+        btn.disabled = false;
+      }
+    }
+
     $("tas-min").onclick = function () { el.classList.add("tas-hidden"); };
     $("tas-settings-btn").onclick = function () { openGameSettings(); };
 
@@ -3754,15 +3519,16 @@
       var enc; try { enc = await rec.serialize(); } catch (e) { setStatus("Encode failed — " + e); return; }
       btn.disabled = true; setStatus("Simulating the editor inputs…");
       var horizon = Math.min(Recording.MAX_FRAMES, rec.numberOfFrames() + 30000);
-      try { var fin = await boardSimulateFinish(enc, horizon); btn.disabled = false; setStatus("⏱ Finishes at " + fmtTime(fin.finishFrames) + "  (" + fin.finishFrames + " frames)"); }
+      try { var fin = await simulateFinish(enc, horizon); btn.disabled = false; setStatus("⏱ Finishes at " + fmtTime(fin.finishFrames) + "  (" + fin.finishFrames + " frames)"); }
       catch (e) { btn.disabled = false; setStatus("These inputs don't reach the finish — " + e.message + "."); }
     };
     $("tas-copy").onclick = function () { copyText(editor.value); setStatus("Copied script to clipboard."); };
     $("tas-clear").onclick = async function () { if (editor.value && !(await tasConfirm("Clear the editor?"))) return; setEditor(""); setStatus("Cleared."); };
     $("tas-save").onclick = function () { saveText(editor.value, "run.tas"); setStatus("Saved run.tas (browser download)."); };
     $("tas-loadf").onclick = function () { loadTextFile(function (txt) { setEditor(txt); setStatus("Loaded file."); refreshStats(); }); };
-    // Apply → re-simulate the VIEWED replay with your edits. Hand the game a
-    // copy of the loaded records with the bound replay's recording replaced by
+    // Apply → re-simulate the VIEWED replay with your edits and submit that run
+    // to the main leaderboard. Hand the game a copy of the loaded records with
+    // the bound replay's recording replaced by
     // the editor's compiled recording, and re-enter the viewer (the game
     // preloads + re-simulates it). You then watch your edited replay.
     $("tas-apply").onclick = async function () {
@@ -3803,38 +3569,19 @@
       try {
         V.enter(V.trackMeta, V.trackData, V.category, edited);
         if (TAS._cmpInvalidate) TAS._cmpInvalidate();   // the edited replay changed → recompute splits
-        setStatus("Re-simulating replay " + (idx + 1) + " with your edits (" + rec.numberOfFrames() + " frames)…");
+        setStatus("Re-simulating replay " + (idx + 1) + " with your edits and submitting it to the main leaderboard…");
+        simulateAndUploadEdited(rec, enc);
       } catch (e) { setStatus("Apply failed: " + e); }
     };
 
-    // Simulate the editor inputs to the finish line, read the real finish time,
-    // and post it to the TAS leaderboard as a full-TAS run. Each failure mode is
-    // reported so it's clear WHY a run can't be uploaded.
+    // Explicit upload button; Apply → replay uses the same upload path automatically.
     $("tas-uptas").onclick = async function () {
-      var btn = $("tas-uptas"); if (btn.disabled) return;
+      if (editedUploadBusy) return;
       var rec; try { rec = scriptToRecording(editor.value || ""); } catch (e) { setStatus("Parse error — " + e); return; }
       if (rec.numberOfInputs() < 1) { setStatus("The editor has no inputs to simulate."); return; }
-      if (!capture.init || !capture.lastCar || capture.lastCar.trackData == null) { setStatus("No track loaded yet — open a replay (Watch) on this track first so the tool captures it."); return; }
-      var trackId = TAS.currentTrackId || (gate.lastRun && gate.lastRun.track_id);
-      if (!trackId) { setStatus("Track id unknown — open this track's leaderboard once (the game then tells the tool its id), then retry."); return; }
       var enc; try { enc = await rec.serialize(); } catch (e) { setStatus("Encode failed — " + e); return; }
-      btn.disabled = true; setStatus("Simulating the editor inputs to the finish line…");
-      var horizon = Math.min(Recording.MAX_FRAMES, rec.numberOfFrames() + 30000), fin;
-      try { fin = await boardSimulateFinish(enc, horizon); }
-      catch (e) { btn.disabled = false; setStatus("These inputs don't reach the finish — " + e.message + ". (The run must cross the finish line to be timed.)"); return; }
-      var run = { track_id: trackId, category: "edited", frames: fin.finishFrames, recording: enc, car_style: (gate.lastRun && gate.lastRun.car_style) || capture.carStyle || "", nickname: uploadNickname(), user_id: TAS.userId || null };
-      setStatus("Finishes at " + fmtTime(fin.finishFrames) + " — posting to the TAS leaderboard…");
-      board.uploadIfBest(run).then(function (res) {
-        btn.disabled = false;
-        if (res.uploaded) { setStatus("Posted edited run — " + fmtTime(fin.finishFrames) + " as “" + run.nickname + "”" + (res.pb ? " (new PB!)" : "") + ". It's under the Edited tag."); if (TAS.lbTwin) TAS.lbTwin.refresh(); }
-        else if (res.error) setStatus("Simulated OK (" + fmtTime(fin.finishFrames) + ") but upload was rejected: " + res.error);
-        else setStatus("Simulated " + fmtTime(fin.finishFrames) + " — your existing best (" + fmtTime(res.prevBest) + ") is faster, so nothing was uploaded.");
-      }).catch(function (e) { btn.disabled = false; setStatus("Simulated OK (" + fmtTime(fin.finishFrames) + ") but upload errored: " + e); });
+      await simulateAndUploadEdited(rec, enc);
     };
-
-    // Upload block is automatic now (a savestate at frame N>0 taints the run);
-    // there is no manual toggle. The overlay border shows the tainted state.
-    if (TAS.overlay) TAS.overlay.setTainted(!!window.__TAS_tainted);
 
     function describeScript() {
       var rec = scriptToRecording(editor.value), n = rec.numberOfFrames();
@@ -3908,7 +3655,7 @@
       // earlier in this same capture pass would otherwise still fire on the key.
       e.preventDefault(); e.stopImmediatePropagation();
       if (e.repeat) return; // OS auto-repeat: swallow, but don't re-fire the action
-      // Overlay (telemetry), upload-block and open-settings work anywhere. The
+      // Overlay (telemetry) and open-settings work anywhere. The
       // editor panel + replay-load + savestate are replay-viewer-only.
       if (code === K.overlay) { if (TAS.overlay) TAS.overlay.toggle(); }
       else if (code === K.panel) { if (!inReplayViewer()) toast("TAS editor is only in the Replay viewer — open a replay (Watch)."); else if (TAS.panel) TAS.panel.toggle(); }
