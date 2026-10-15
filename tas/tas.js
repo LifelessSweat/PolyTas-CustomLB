@@ -14,7 +14,7 @@
  *   - the sim worker filename "simulation_worker.bundle.js"
  *   - the numeric messageType protocol + field shapes
  *   - the 227-byte CarState binary layout
- *   - the leaderboard host polyproxy.polymodloader.com + "/v6/leaderboard"
+ *   - the leaderboard host polytrackproxy.gassers.workers.dev + "/v6/leaderboard"
  *
  * Phase 2 (bruteforce) adds tas/tas-sim.worker.js + tas/vendor/determinism.js.
  * Phase 3 (savestate) adds replay-drive support.
@@ -832,7 +832,7 @@
       if (String(method || "").toUpperCase() !== "POST") return false;
       var u = String(url || ""), host = "", path = u;
       try { var p = new URL(u, location.href); host = p.host; path = p.pathname; } catch (e) { host = u; path = u.split("?")[0]; }
-      if (host !== "polyproxy.polymodloader.com") return false; // only the game API
+      if (host !== "polytrackproxy.gassers.workers.dev") return false; // only the game API
       if (/\/leaderboard$/.test(path)) return true;            // the known submit endpoint
       try { if (typeof body === "string" && /(^|&)recording=/.test(body)) return true; } catch (e) {} // submit body signature
       return false;
@@ -869,7 +869,7 @@
    * Every TAS and savestate submission goes through the same endpoint as the
    * game's main leaderboard.
    * ================================================================== */
-  var MAIN_LB_URL = "https://polyproxy.polymodloader.com/v6/leaderboard";
+  var MAIN_LB_URL = "https://polytrackproxy.gassers.workers.dev/v6/leaderboard";
   function submitOfficialRun(run) {
     return new Promise(function (resolve) {
       var userToken = gameUserToken();
@@ -929,7 +929,7 @@
   gate.noteUrl = function (url) {
     try {
       var u = new URL(String(url || ""), location.href);
-      if (u.host === "polyproxy.polymodloader.com" && /\/v6\/leaderboard$/.test(u.pathname)) {
+      if (u.host === "polytrackproxy.gassers.workers.dev" && /\/v6\/leaderboard$/.test(u.pathname)) {
         var t = u.searchParams.get("trackId");
         if (t && t !== TAS.currentTrackId) { TAS.currentTrackId = t; bus.emit("track", t); }
         var uh = u.searchParams.get("userTokenHash");
